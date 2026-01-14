@@ -4,53 +4,59 @@ import numpy as np
 import plotly.express as px
 import streamlit as st
 
-# Configuración de la página
 st.set_page_config(page_title="Calculador ROIC", layout="wide")
 
-# --- Lógica de Cálculo ---
 @st.cache_data
-def calculate_roic_for_ticker(ticker_symbol, num_years=5): # Fijado a 5 años por defecto
+def calculate_roic_for_ticker(ticker_symbol, num_years=5):
     roic_values_by_year = {} 
     try:
         ticker = yf.Ticker(ticker_symbol)
+        # Obtenemos los estados financieros
         income_stmt = ticker.income_stmt
         balance_sheet = ticker.balance_sheet
 
         if income_stmt.empty or balance_sheet.empty:
-            return {f"Año -{i}": np.nan for i in range(num_years)}
+            return {}
 
-        # Limitamos el bucle al número de años disponibles o al máximo fijado
-        years_available = min(num_years, income_stmt.shape[1])
-        
-        for i in range(years_available):
+        # ALINEACIÓN: Buscamos las fechas que existan en AMBOS documentos
+        common_dates = income_stmt.columns.intersection(balance_sheet.columns)
+        common_dates = sorted(common_dates, reverse=True)[:num_years]
+
+        for date in common_dates:
             try:
-                current_year_income = income_stmt.iloc[:, i]
-                current_year_bs = balance_sheet.iloc[:, i]
-                fiscal_year = income_stmt.columns[i].year
+                is_data = income_stmt[date]
+                bs_data = balance_sheet[date]
+                year = date.year
 
-                # Datos de cuenta de resultados
-                ebit = current_year_income.get('EBIT', 0)
-                tax_rate = current_year_income.get('Tax Rate For Calcs')
+                # --- EXTRACCIÓN ROBUSTA DE DATOS ---
+                # EBIT
+                ebit = is_data.get('EBIT', is_data.get('Operating Income', 0))
                 
-                # Backup de Tax Rate si no existe en Yahoo
+                # Tasa impositiva (Tax Rate)
+                tax_rate = is_data.get('Tax Rate For Calcs')
                 if tax_rate is None or pd.isna(tax_rate):
-                    pretax_inc = current_year_income.get('Pretax Income', 0)
-                    tax_prov = current_year_income.get('Tax Provision', 0)
-                    tax_rate = (tax_prov / pretax_inc) if pretax_inc > 0 else 0.21
-                
-                # Balance Sheet
-                equity = current_year_bs.get('Stockholders Equity', 0)
-                st_debt = current_year_bs.get('Current Debt And Capital Lease Obligation', 0)
-                lt_debt = current_year_bs.get('Long Term Debt And Capital Lease Obligation', 0)
-                cash = current_year_bs.get('Cash And Cash Equivalents', 0)
+                    pretax_inc = is_data.get('Pretax Income', 0)
+                    tax_prov = is_data.get('Tax Provision', 0)
+                    tax_rate = (tax_prov / pretax_inc) if (pretax_inc and pretax_inc > 0) else 0.21
 
+                # Capital Invertido: Equity + Deuda Total - Caja
+                equity = bs_data.get('Stockholders Equity', bs_data.get('Total Equity Gross Minority Interest', 0))
+                
+                # Intentamos obtener deuda total de varias formas
+                total_debt = bs_data.get('Total Debt', 
+                             bs_data.get('Current Debt And Capital Lease Obligation', 0) + 
+                             bs_data.get('Long Term Debt And Capital Lease Obligation', 0))
+                
+                cash = bs_data.get('Cash And Cash Equivalents', bs_data.get('Cash Cash Equivalents And Short Term Investments', 0))
+
+                # Cálculo de ROIC
                 nopat = ebit * (1 - tax_rate)
-                invested_capital = equity + st_debt + lt_debt - cash
+                invested_capital = equity + total_debt - cash
 
                 if invested_capital > 0:
-                    roic_values_by_year[fiscal_year] = nopat / invested_capital
+                    roic_values_by_year[year] = nopat / invested_capital
                 else:
-                    roic_values_by_year[fiscal_year] = np.nan
+                    roic_values_by_year[year] = np.nan
 
             except Exception:
                 continue
@@ -62,49 +68,38 @@ def calculate_roic_for_ticker(ticker_symbol, num_years=5): # Fijado a 5 años po
 # --- Interfaz de Usuario ---
 st.title("Calculador ROIC") 
 
-# Barra lateral modificada según tus instrucciones
 with st.sidebar:
     st.subheader("Introduce los tikkers que quieres analizar separados por comas")
-    # Dejamos el label vacío porque el encabezado ya da la instrucción
     tickers_input = st.text_input(label="Ejemplo: V, MSFT, AAPL", value="V, MSFT, GOOGL, AAPL")
     st.divider()
-    st.info("💡 El ROIC se calcula como NOPAT / Capital Invertido.")
+    st.info("La fórmula utilizada es:")
+    st.latex(r"ROIC = \frac{EBIT \times (1 - Tax Rate)}{Equity + Debt - Cash}")
 
 if tickers_input:
     ticker_list = [t.strip().upper() for t in tickers_input.split(',') if t.strip()]
     
-    with st.spinner('Extrayendo datos financieros...'):
-        # Llamamos a la función con el valor fijo de 5 años
-        all_results = {symbol: calculate_roic_for_ticker(symbol, num_years=5) for symbol in ticker_list}
+    with st.spinner('Extrayendo y alineando datos...'):
+        all_results = {symbol: calculate_roic_for_ticker(symbol) for symbol in ticker_list}
+        # Crear DataFrame y limpiar filas vacías
         roic_df = pd.DataFrame.from_dict(all_results, orient='index')
+        roic_df = roic_df.sort_index(axis=1) # Ordenar años cronológicamente
 
     if not roic_df.dropna(how='all').empty:
-        # Filtrar columnas numéricas (años)
-        year_cols = sorted([c for c in roic_df.columns if isinstance(c, int)])
-        roic_numeric = roic_df[year_cols].copy()
-
-        # 1. Gráfico interactivo
+        # 1. Gráfico
         st.subheader("📈 Tendencia Histórica")
-        plot_data = roic_numeric.reset_index().melt(id_vars='index', var_name='Año', value_name='ROIC')
+        plot_data = roic_df.reset_index().melt(id_vars='index', var_name='Año', value_name='ROIC')
         plot_data.columns = ['Ticker', 'Año', 'ROIC']
         
-        fig = px.line(plot_data, x='Año', y='ROIC', color='Ticker', 
-                      markers=True, template="plotly_white")
-        fig.update_layout(yaxis_tickformat='.1%')
+        fig = px.line(plot_data, x='Año', y='ROIC', color='Ticker', markers=True, template="plotly_white")
+        fig.update_layout(yaxis_tickformat='.1%', xaxis_type='category')
         st.plotly_chart(fig, use_container_width=True)
 
-        # 2. Tabla de datos
+        # 2. Tabla
         st.subheader("📋 Datos Detallados")
-        display_df = roic_numeric[sorted(year_cols, reverse=True)]
+        display_df = roic_df[sorted(roic_df.columns, reverse=True)]
+        st.dataframe(display_df.style.format("{:.2%}", na_rep="N/A").highlight_max(axis=0, color='#1f77b422'))
         
-        st.dataframe(
-            display_df.style.format("{:.2%}", na_rep="N/A")
-            .highlight_max(axis=0, color='#1f77b422') # Resalta el máximo de cada año
-        )
-
-        # 3. Botón de descarga
         csv = display_df.to_csv().encode('utf-8')
         st.download_button("📥 Descargar CSV", csv, "datos_roic.csv", "text/csv")
-
     else:
-        st.error("No se han podido encontrar datos para esos tickers. Asegúrate de que los nombres sean correctos.")
+        st.warning("No se encontraron datos suficientes para generar el análisis.")
